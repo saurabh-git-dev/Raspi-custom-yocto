@@ -8,18 +8,19 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=912d9840d25da645fb81a37c77a1b8b3"
 
 # ---------------------------------------------------------------------------
 # Source – clone from Hailo's public GitHub repository.
-# SRCREV is pinned to the v4.19.0 release tag commit.
-# Run `git ls-remote https://github.com/hailo-ai/hailort refs/tags/v4.19.0`
-# and update SRCREV when upgrading to a new release.
+# For reproducible builds, replace AUTOREV with the exact commit SHA of the
+# desired release tag (e.g. v4.19.0) once you have confirmed it builds:
+#
+#   SRCREV = "<40-char SHA from: git ls-remote \
+#              https://github.com/hailo-ai/hailort refs/tags/v4.19.0>"
+#
+# Using AUTOREV is acceptable for development but must be pinned for
+# production images to guarantee reproducibility.
 # ---------------------------------------------------------------------------
 HAILORT_VERSION = "4.19.0"
 
-SRC_URI = "git://github.com/hailo-ai/hailort.git;protocol=https;branch=master;tag=v${HAILORT_VERSION}"
-SRCREV  = "0000000000000000000000000000000000000000"
-# TODO: Replace the SRCREV placeholder above with the actual SHA of the
-#       v4.19.0 tag before building.  Until then, set SRCREV_FORMAT if
-#       using AUTOREV for development:
-#   SRCREV = "${AUTOREV}"
+SRC_URI = "git://github.com/hailo-ai/hailort.git;protocol=https;branch=master"
+SRCREV  = "${AUTOREV}"
 PV      = "${HAILORT_VERSION}+git${SRCPV}"
 S       = "${WORKDIR}/git"
 
