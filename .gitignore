@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Yocto build artefacts
+build/tmp/
+build/cache/
+build/sstate-cache/
+downloads/
+sstate-cache/
