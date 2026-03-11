@@ -1,0 +1,30 @@
+[Unit]
+Description=OTA Update HTTP Server
+Documentation=https://github.com/saurabh-git-dev/Raspi-custom-yocto
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/share/ota-update/ota-server.py
+Restart=on-failure
+RestartSec=5s
+
+# Run as root – required for raw partition write and cmdline.txt update
+User=root
+Group=root
+
+# Environment
+Environment="OTA_PORT=8080"
+Environment="OTA_SLOT_A=/dev/mmcblk0p2"
+Environment="OTA_SLOT_B=/dev/mmcblk0p3"
+Environment="OTA_UPLOAD_DIR=/data/ota"
+Environment="OTA_MAX_MB=4096"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ota-server
+
+[Install]
+WantedBy=multi-user.target

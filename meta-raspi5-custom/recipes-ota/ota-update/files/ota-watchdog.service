@@ -1,0 +1,16 @@
+[Unit]
+Description=OTA Boot Watchdog – confirm or rollback after an update
+DefaultDependencies=no
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ota-watchdog.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ota-watchdog
+
+[Install]
+WantedBy=multi-user.target

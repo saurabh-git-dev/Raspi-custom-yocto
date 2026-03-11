@@ -1,0 +1,266 @@
+name: Build Raspi5 Yocto Image
+
+# ──────────────────────────────────────────────────────────────────────────
+# Triggered manually from the GitHub UI (Actions → "Build Raspi5 Yocto Image"
+# → "Run workflow").
+# ──────────────────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+      image_target:
+        description: 'BitBake target to build'
+        required: false
+        default: 'raspi5-image'
+        type: string
+      yocto_branch:
+        description: 'Yocto / layer branch (e.g. scarthgap, kirkstone)'
+        required: false
+        default: 'scarthgap'
+        type: string
+      upload_image:
+        description: 'Upload the built image as a workflow artifact'
+        required: false
+        default: true
+        type: boolean
+
+# ──────────────────────────────────────────────────────────────────────────
+# A full Yocto build requires roughly 100 GB of disk space and several hours
+# of CPU time.  GitHub-hosted ubuntu-22.04 runners provide ~14 GB of free
+# disk by default – not enough for a complete build.  We therefore:
+#   a) Free as much runner disk as possible before building, and
+#   b) Support self-hosted runners via the RUNNER_LABEL repository variable
+#      (Settings → Actions → Variables → New repository variable).
+#
+# To use a self-hosted runner set the repository variable:
+#   RUNNER_LABEL = self-hosted
+# otherwise the workflow falls back to ubuntu-22.04.
+# ──────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: bitbake ${{ inputs.image_target }}
+    # Use the RUNNER_LABEL repository variable when set, otherwise ubuntu-22.04
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-22.04' }}
+    timeout-minutes: 480   # 8 hours – adjust to match your infrastructure
+
+    env:
+      BRANCH: ${{ inputs.yocto_branch }}
+      TARGET: ${{ inputs.image_target }}
+      # Top-level workspace layout (all paths are siblings of GITHUB_WORKSPACE)
+      WORKSPACE: ${{ github.workspace }}
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────
+      - name: Checkout meta-raspi5-custom layer
+        uses: actions/checkout@v4
+        with:
+          # Checkout INTO a sub-directory so sibling layer clones live at the
+          # same level: $WORKSPACE/poky, $WORKSPACE/meta-openembedded, etc.
+          path: Raspi-custom-yocto
+
+      # ── 2. Free disk space ─────────────────────────────────────────────
+      # On GitHub-hosted runners we reclaim ~30 GB by removing large optional
+      # packages that are not needed for a cross-compilation build.
+      - name: Free runner disk space
+        if: vars.RUNNER_LABEL == '' || vars.RUNNER_LABEL == 'ubuntu-22.04'
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h /
+
+          sudo apt-get remove -y --purge \
+            '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' \
+            'php.*' '^mongodb-.*' '^mysql-.*' \
+            azure-cli google-cloud-sdk google-chrome-stable firefox \
+            powershell mono-devel libgl1-mesa-dri \
+          2>/dev/null || true
+
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" \
+          2>/dev/null || true
+
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      # ── 3. Install Yocto host dependencies ─────────────────────────────
+      - name: Install Yocto host dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            gawk wget git diffstat unzip texinfo gcc build-essential \
+            chrpath socat cpio python3 python3-pip python3-pexpect \
+            xz-utils debianutils iputils-ping python3-git python3-jinja2 \
+            libegl1-mesa libsdl1.2-dev xterm python3-subunit mesa-common-dev \
+            zstd liblz4-tool file locales libacl1 bmaptool
+          sudo locale-gen en_US.UTF-8
+
+      # ── 4. Restore caches ──────────────────────────────────────────────
+      # Shared download cache – keyed on recipe content so it survives recipe
+      # changes and is only fully invalidated when all recipe hashes change.
+      - name: Restore download cache
+        id: cache-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: downloads
+          # Restore any prior download cache; a new one is saved after the build.
+          key: yocto-dl-${{ env.BRANCH }}-${{ hashFiles('Raspi-custom-yocto/meta-raspi5-custom/**') }}
+          restore-keys: |
+            yocto-dl-${{ env.BRANCH }}-
+            yocto-dl-
+
+      # Shared-state (sstate) cache – accelerates incremental builds
+      - name: Restore sstate cache
+        id: cache-sstate
+        uses: actions/cache/restore@v4
+        with:
+          path: sstate-cache
+          key: yocto-sstate-${{ env.BRANCH }}-${{ hashFiles('Raspi-custom-yocto/meta-raspi5-custom/**') }}
+          restore-keys: |
+            yocto-sstate-${{ env.BRANCH }}-
+            yocto-sstate-
+
+      # ── 5. Clone upstream Yocto layers ─────────────────────────────────
+      - name: Clone poky
+        run: |
+          git clone --depth 1 -b "$BRANCH" \
+            https://git.yoctoproject.org/poky \
+            poky
+
+      - name: Clone meta-openembedded
+        run: |
+          git clone --depth 1 -b "$BRANCH" \
+            https://git.openembedded.org/meta-openembedded \
+            meta-openembedded
+
+      - name: Clone meta-raspberrypi
+        run: |
+          git clone --depth 1 -b "$BRANCH" \
+            https://github.com/agherzan/meta-raspberrypi \
+            meta-raspberrypi
+
+      # ── 6. Initialise BitBake build environment ─────────────────────────
+      # oe-init-build-env creates build/conf/{bblayers,local}.conf stubs and
+      # sets up BitBake PATH/environment variables.  We run it in a sub-shell
+      # so it does not affect the runner's PATH permanently; the real build
+      # step below sources it again inside the same shell.
+      - name: Initialise BitBake build directory
+        run: |
+          # Create build/conf/ with default stubs (output suppressed)
+          source poky/oe-init-build-env build > /dev/null
+          echo "Build directory initialised at: $(pwd)"
+
+      # ── 7. Write build configuration ────────────────────────────────────
+      - name: Write bblayers.conf
+        run: |
+          sed "s|##OEROOT##|${WORKSPACE}/poky|g" \
+            Raspi-custom-yocto/build/conf/bblayers.conf \
+            > build/conf/bblayers.conf
+          echo "--- bblayers.conf ---"
+          cat build/conf/bblayers.conf
+
+      - name: Write local.conf
+        run: |
+          cp Raspi-custom-yocto/build/conf/local.conf build/conf/local.conf
+
+          NCPUS=$(nproc)
+          cat >> build/conf/local.conf <<EOF
+
+          # ── CI overrides ──────────────────────────────────────────────
+          # Shared cache directories (populated from the cache restore steps)
+          DL_DIR    = "${WORKSPACE}/downloads"
+          SSTATE_DIR = "${WORKSPACE}/sstate-cache"
+
+          # Parallel build tuning
+          BB_NUMBER_THREADS = "${NCPUS}"
+          PARALLEL_MAKE     = "-j${NCPUS}"
+
+          # Keep build output deterministic across runs
+          BB_GENERATE_MIRROR_TARBALLS = "1"
+          EOF
+
+          echo "--- local.conf (CI additions) ---"
+          tail -20 build/conf/local.conf
+
+      # ── 8. Build the image ──────────────────────────────────────────────
+      - name: Build ${{ inputs.image_target }}
+        run: |
+          source poky/oe-init-build-env build > /dev/null
+          echo "Starting bitbake ${TARGET} at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          bitbake "${TARGET}"
+          echo "Build finished at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+      # ── 9. Save caches ─────────────────────────────────────────────────
+      # Always save even if the build failed, so partial results are reused.
+      - name: Save download cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: downloads
+          key: yocto-dl-${{ env.BRANCH }}-${{ hashFiles('Raspi-custom-yocto/meta-raspi5-custom/**') }}
+
+      - name: Save sstate cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sstate-cache
+          key: yocto-sstate-${{ env.BRANCH }}-${{ hashFiles('Raspi-custom-yocto/meta-raspi5-custom/**') }}
+
+      # ── 10. Collect & upload artefacts ──────────────────────────────────
+      - name: Collect build artefacts
+        if: success()
+        run: |
+          DEPLOY="build/tmp/deploy/images/raspberrypi5"
+          mkdir -p dist
+
+          # Copy image files we care about
+          find "${DEPLOY}" \( \
+            -name "*.wic.bz2"  -o \
+            -name "*.wic.bmap" -o \
+            -name "*.manifest" -o \
+            -name "*.ext4"     \
+          \) -exec cp -v {} dist/ \;
+
+          echo "=== Artefacts to upload ==="
+          ls -lh dist/
+
+      - name: Upload image artefacts
+        if: success() && inputs.upload_image
+        uses: actions/upload-artifact@v4
+        with:
+          name: raspi5-image-${{ env.TARGET }}-${{ github.run_number }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 11. Build summary ───────────────────────────────────────────────
+      - name: Write build summary
+        if: always()
+        run: |
+          {
+            echo "## Raspi5 Yocto Build Summary"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| Target    | \`${TARGET}\` |"
+            echo "| Branch    | \`${BRANCH}\` |"
+            echo "| Runner    | \`${{ runner.name }}\` |"
+            echo "| Run       | [\`#${{ github.run_number }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo ""
+            if [ -d dist ] && [ "$(ls -A dist 2>/dev/null)" ]; then
+              echo "### Image files"
+              echo ""
+              echo "| File | Size |"
+              echo "|------|------|"
+              for f in dist/*; do
+                echo "| \`$(basename "$f")\` | $(du -sh "$f" | cut -f1) |"
+              done
+            else
+              echo "_No image files collected (build may have failed or upload was disabled)._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
